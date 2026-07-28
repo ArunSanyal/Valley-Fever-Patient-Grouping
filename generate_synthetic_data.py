@@ -1,328 +1,219 @@
-"""
-Synthetic Valley Fever (coccidioidomycosis) patient data generator.
-
-WHY SYNTHETIC DATA
--------------------
-Real Valley Fever patient records are protected health information and any
-project touching them requires IRB approval and data-use agreements. This
-mirrors the constraint Prof. Leroy's own lab operates under, which is why
-their symptom-extraction work trains on privacy-preserving LLM-generated
-synthetic clinical text rather than real notes. Here we apply the same
-justification to structured (tabular) data instead of free text: we generate
-statistically plausible patients so the clustering pipeline can be built,
-tested, and demonstrated with zero privacy exposure and no IRB dependency.
-
-WHY LATENT ARCHETYPES + NOISE (RATHER THAN FULLY RANDOM FEATURES)
--------------------------------------------------------------------
-If every feature were drawn independently at random, "clusters" found later
-would be statistical artifacts with no ground truth to check against -- we
-could not tell a good clustering solution from a lucky one. Instead, this
-generator samples most patients from one of a small number of hidden
-"archetypes": realistic joint profiles of symptom severity + social
-determinants of health (SDOH) that plausibly co-occur in practice (e.g.
-severe symptoms tend to co-occur with poor care access in real populations,
-not because one causes the other, but because both reflect the same
-underlying deprivation). A `true_archetype` label is retained so that
-cluster.py / evaluate.py can later check whether K-Prototypes actually
-recovers this structure -- a genuine test of the method, not a foregone
-conclusion.
-
-A configurable fraction of patients (`noise_fraction`) is instead drawn with
-EACH feature sampled independently from the overall population's marginal
-distribution (a uniform mixture across archetypes), decoupling the joint
-structure that defines an archetype. These patients don't cleanly belong to
-any archetype -- exactly like real populations always contain atypical
-individuals -- which keeps the clustering problem from being trivially easy
-and gives the elbow-method / silhouette analysis something genuine to argue
-about.
-
-WHY `occupational_exposure_risk` (BEYOND THE BASE ASSIGNMENT PROMPT)
------------------------------------------------------------------------
-Coccidioides spores live in Southwestern soil and are inhaled when soil is
-disturbed, so occupational exposure (construction, agriculture, military
-ground work, landscaping) is a well-documented Valley Fever risk factor
-specific to Arizona's epidemiology -- distinct from the generic SDOH domains
-in the base assignment (housing, employment, education, social support,
-access to care). Including it lets a cluster emerge that is symptomatic and
-high-exposure but otherwise well-resourced (e.g. insured construction
-workers) -- a group whose actionable intervention is proactive worksite
-screening, not the social-services outreach appropriate for a low-resource
-cluster. That distinction is the kind of precision-medicine, subgroup-specific
-strategy Prof. Leroy's research aims to surface.
-
-IMPORTANT: `true_archetype` is a hidden ground-truth label for OUR OWN
-validation only (did clustering recover real structure?). It must NEVER be
-passed as a feature into the clustering algorithm itself -- doing so would be
-data leakage, since it is not something a clinician would know in advance.
-"""
-
-from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Feature definitions
-# ---------------------------------------------------------------------------
+N = 200
 
-SYMPTOM_COLUMNS = [
-    "fatigue",
-    "cough",
-    "fever",
-    "night_sweats",
-    "chest_pain",
-    "arthralgia",
-    "headache",
-    "rash",
-    "weight_loss",
-    "dyspnea",
+
+rng = np.random.default_rng(seed=42)
+
+
+ARCHETYPES = [
+    {
+        "name": "delayed_diagnosis_vulnerable",
+        # uninsured + unstable housing -> hard to get care, longer to diagnose
+        "n": 45,
+        "housing_stability_weights": {"unstable": 0.50, "at_risk": 0.35, "stable": 0.15},
+        "employment_status_weights": {
+            "employed_outdoor": 0.40, "unemployed": 0.35,
+            "employed_indoor": 0.15, "retired": 0.10,
+        },
+        "education_level_weights": {
+            "less_than_hs": 0.35, "hs_grad": 0.35,
+            "some_college": 0.20, "bachelors_plus": 0.10,
+        },
+        "insurance_status_weights": {"uninsured": 0.45, "underinsured": 0.40, "insured": 0.15},
+        "social_support_mean": 4.5,
+        "distance_mean": 22,
+        "respiratory_severity_mean": 2.0,
+        "fatigue_level_mean": 2.2,
+        "joint_pain_mean": 1.4,
+        "fever_prob": 0.60,
+        "erythema_prob": 0.08,
+        "symptom_duration_mean": 45,
+        "prior_misdiagnosis_mean": 2.0,
+    },
+    {
+        "name": "stable_well_managed",
+        # insured + stable + indoor job -> caught early, mild, few misdiagnoses
+        "n": 55,
+        "housing_stability_weights": {"stable": 0.85, "at_risk": 0.12, "unstable": 0.03},
+        "employment_status_weights": {
+            "employed_indoor": 0.55, "employed_outdoor": 0.15,
+            "retired": 0.20, "unemployed": 0.10,
+        },
+        "education_level_weights": {
+            "bachelors_plus": 0.45, "some_college": 0.30,
+            "hs_grad": 0.20, "less_than_hs": 0.05,
+        },
+        "insurance_status_weights": {"insured": 0.85, "underinsured": 0.13, "uninsured": 0.02},
+        "social_support_mean": 7.5,
+        "distance_mean": 8,
+        "respiratory_severity_mean": 0.7,
+        "fatigue_level_mean": 0.9,
+        "joint_pain_mean": 0.6,
+        "fever_prob": 0.35,
+        "erythema_prob": 0.04,
+        "symptom_duration_mean": 8,
+        "prior_misdiagnosis_mean": 0.3,
+    },
+    {
+        "name": "elderly_moderate_risk",
+        # mostly retired, lower social support, joint pain can look like normal aging
+        "n": 50,
+        "housing_stability_weights": {"stable": 0.70, "at_risk": 0.25, "unstable": 0.05},
+        "employment_status_weights": {
+            "retired": 0.80, "employed_indoor": 0.10,
+            "unemployed": 0.08, "employed_outdoor": 0.02,
+        },
+        "education_level_weights": {
+            "hs_grad": 0.40, "some_college": 0.30,
+            "less_than_hs": 0.20, "bachelors_plus": 0.10,
+        },
+        "insurance_status_weights": {"insured": 0.55, "underinsured": 0.40, "uninsured": 0.05},
+        "social_support_mean": 3.5,
+        "distance_mean": 15,
+        "respiratory_severity_mean": 1.5,
+        "fatigue_level_mean": 1.7,
+        "joint_pain_mean": 1.8,
+        "fever_prob": 0.45,
+        "erythema_prob": 0.05,
+        "symptom_duration_mean": 25,
+        "prior_misdiagnosis_mean": 1.0,
+    },
+    {
+        "name": "young_acute_high_exposure",
+        # outdoor workers, heavy exposure -> hits hard and fast, more rash
+        "n": 50,
+        "housing_stability_weights": {"stable": 0.75, "at_risk": 0.20, "unstable": 0.05},
+        "employment_status_weights": {
+            "employed_outdoor": 0.70, "employed_indoor": 0.20,
+            "unemployed": 0.08, "retired": 0.02,
+        },
+        "education_level_weights": {
+            "hs_grad": 0.40, "some_college": 0.30,
+            "less_than_hs": 0.20, "bachelors_plus": 0.10,
+        },
+        "insurance_status_weights": {"insured": 0.60, "underinsured": 0.30, "uninsured": 0.10},
+        "social_support_mean": 6.5,
+        "distance_mean": 14,
+        "respiratory_severity_mean": 2.4,
+        "fatigue_level_mean": 2.0,
+        "joint_pain_mean": 1.2,
+        "fever_prob": 0.75,
+        "erythema_prob": 0.20,
+        "symptom_duration_mean": 12,
+        "prior_misdiagnosis_mean": 0.5,
+    },
 ]
 
-CATEGORICAL_COLUMNS = [
-    "housing_stability",
-    "employment_status",
-    "education_level",
-    "social_support",
-    "access_to_care",
-    "occupational_exposure_risk",
-]
 
-CATEGORICAL_LEVELS = {
-    "housing_stability": ["stable", "unstable", "homeless"],
-    "employment_status": ["employed", "unemployed", "unable_to_work"],
-    "education_level": ["less_than_hs", "hs_diploma", "some_college", "bachelor_plus"],
-    "social_support": ["strong", "moderate", "weak"],
-    "access_to_care": ["insured_regular_care", "insured_no_regular_care", "uninsured"],
-    "occupational_exposure_risk": ["high", "low"],
-}
-
-# Human-readable name for each archetype index, used as the `true_archetype`
-# ground-truth label. Order matters: it must match the keys used in the two
-# parameter dicts below.
-ARCHETYPE_NAMES = {
-    0: "mild_well_supported",
-    1: "severe_underserved",
-    2: "high_exposure_resourced",
-    3: "moderate_chronic_under_resourced_access",
-}
-
-# Per-archetype (mean, std) for each numeric symptom severity, on a 0-4 scale
-# (none / mild / moderate / severe / very severe). Values are clipped to
-# [0, 4] at draw time since a Gaussian can otherwise stray outside the scale.
-ARCHETYPE_SYMPTOM_PARAMS = {
-    0: {  # mild_well_supported: low severity across the board
-        "fatigue": (0.8, 0.6), "cough": (0.6, 0.5), "fever": (0.4, 0.4),
-        "night_sweats": (0.5, 0.5), "chest_pain": (0.4, 0.4), "arthralgia": (0.6, 0.5),
-        "headache": (0.7, 0.5), "rash": (0.3, 0.4), "weight_loss": (0.4, 0.4),
-        "dyspnea": (0.5, 0.5),
-    },
-    1: {  # severe_underserved: high severity across the board
-        "fatigue": (3.4, 0.6), "cough": (3.2, 0.6), "fever": (3.0, 0.7),
-        "night_sweats": (3.1, 0.6), "chest_pain": (2.8, 0.7), "arthralgia": (3.0, 0.6),
-        "headache": (2.7, 0.7), "rash": (2.0, 0.8), "weight_loss": (2.9, 0.7),
-        "dyspnea": (3.1, 0.6),
-    },
-    2: {  # high_exposure_resourced: respiratory/systemic symptoms from
-          # occupational dust exposure dominate; skin/wasting symptoms don't
-        "fatigue": (2.2, 0.6), "cough": (2.8, 0.5), "fever": (1.8, 0.6),
-        "night_sweats": (1.6, 0.6), "chest_pain": (2.3, 0.6), "arthralgia": (1.4, 0.5),
-        "headache": (1.5, 0.5), "rash": (0.8, 0.5), "weight_loss": (1.0, 0.5),
-        "dyspnea": (2.5, 0.6),
-    },
-    3: {  # moderate_chronic_under_resourced_access: lingering fatigue/joint
-          # pain/weight loss consistent with delayed or inconsistent care
-        "fatigue": (2.6, 0.6), "cough": (1.8, 0.6), "fever": (1.5, 0.6),
-        "night_sweats": (1.7, 0.6), "chest_pain": (1.6, 0.6), "arthralgia": (2.4, 0.6),
-        "headache": (1.9, 0.6), "rash": (1.0, 0.5), "weight_loss": (2.2, 0.6),
-        "dyspnea": (1.7, 0.6),
-    },
-}
-
-# Per-archetype category probabilities for each SDOH / categorical feature.
-# Each inner dict's values must sum to 1.0.
-ARCHETYPE_CATEGORICAL_PARAMS = {
-    0: {
-        "housing_stability": {"stable": 0.85, "unstable": 0.12, "homeless": 0.03},
-        "employment_status": {"employed": 0.80, "unemployed": 0.15, "unable_to_work": 0.05},
-        "education_level": {"less_than_hs": 0.05, "hs_diploma": 0.25, "some_college": 0.35, "bachelor_plus": 0.35},
-        "social_support": {"strong": 0.70, "moderate": 0.25, "weak": 0.05},
-        "access_to_care": {"insured_regular_care": 0.80, "insured_no_regular_care": 0.15, "uninsured": 0.05},
-        "occupational_exposure_risk": {"high": 0.15, "low": 0.85},
-    },
-    1: {
-        "housing_stability": {"stable": 0.10, "unstable": 0.45, "homeless": 0.45},
-        "employment_status": {"employed": 0.10, "unemployed": 0.55, "unable_to_work": 0.35},
-        "education_level": {"less_than_hs": 0.45, "hs_diploma": 0.35, "some_college": 0.15, "bachelor_plus": 0.05},
-        "social_support": {"strong": 0.05, "moderate": 0.25, "weak": 0.70},
-        "access_to_care": {"insured_regular_care": 0.05, "insured_no_regular_care": 0.25, "uninsured": 0.70},
-        "occupational_exposure_risk": {"high": 0.55, "low": 0.45},
-    },
-    2: {
-        "housing_stability": {"stable": 0.70, "unstable": 0.25, "homeless": 0.05},
-        "employment_status": {"employed": 0.75, "unemployed": 0.20, "unable_to_work": 0.05},
-        "education_level": {"less_than_hs": 0.30, "hs_diploma": 0.45, "some_college": 0.20, "bachelor_plus": 0.05},
-        "social_support": {"strong": 0.45, "moderate": 0.40, "weak": 0.15},
-        "access_to_care": {"insured_regular_care": 0.55, "insured_no_regular_care": 0.35, "uninsured": 0.10},
-        "occupational_exposure_risk": {"high": 0.90, "low": 0.10},
-    },
-    3: {
-        "housing_stability": {"stable": 0.45, "unstable": 0.40, "homeless": 0.15},
-        "employment_status": {"employed": 0.35, "unemployed": 0.35, "unable_to_work": 0.30},
-        "education_level": {"less_than_hs": 0.20, "hs_diploma": 0.40, "some_college": 0.30, "bachelor_plus": 0.10},
-        "social_support": {"strong": 0.25, "moderate": 0.50, "weak": 0.25},
-        "access_to_care": {"insured_regular_care": 0.15, "insured_no_regular_care": 0.60, "uninsured": 0.25},
-        "occupational_exposure_risk": {"high": 0.35, "low": 0.65},
-    },
-}
-
-NOISE_LABEL = "noise"
+def sample_categorical(weights, n, rng):
+    """Draw n values from a categorical distribution defined by weights."""
+    categories = list(weights.keys())
+    probs = list(weights.values())
+    return rng.choice(categories, size=n, p=probs)
 
 
-# ---------------------------------------------------------------------------
-# Per-patient feature draws
-# ---------------------------------------------------------------------------
-
-def _draw_numeric_from_archetype(archetype_idx: int, rng: np.random.Generator) -> dict:
-    return {
-        feat: float(np.clip(rng.normal(mean, std), 0, 4))
-        for feat, (mean, std) in ARCHETYPE_SYMPTOM_PARAMS[archetype_idx].items()
-    }
+def sample_ordinal(mean, n, rng, std=0.7, low=0, high=3):
+    """Draw n values for a 0-3 symptom score, centered on mean with some noise."""
+    values = rng.normal(loc=mean, scale=std, size=n)
+    return np.clip(values.round(), low, high).astype(int)
 
 
-def _draw_categorical_from_archetype(archetype_idx: int, rng: np.random.Generator) -> dict:
-    result = {}
-    for feat, probs in ARCHETYPE_CATEGORICAL_PARAMS[archetype_idx].items():
-        levels = list(probs.keys())
-        weights = list(probs.values())
-        result[feat] = rng.choice(levels, p=weights)
-    return result
+def generate_cohort(archetypes=ARCHETYPES, rng=rng):
+    blocks = []
 
+    for arch in archetypes:
+        n = arch["n"]
 
-def _draw_noise_numeric(n_archetypes: int, rng: np.random.Generator) -> dict:
-    # Each feature independently mixture-sampled across archetypes: no single
-    # archetype governs the whole patient, so joint structure is destroyed
-    # while each feature's own marginal distribution is preserved.
-    result = {}
-    for feat in SYMPTOM_COLUMNS:
-        a = rng.integers(0, n_archetypes)
-        mean, std = ARCHETYPE_SYMPTOM_PARAMS[a][feat]
-        result[feat] = float(np.clip(rng.normal(mean, std), 0, 4))
-    return result
+        housing_stability = sample_categorical(arch["housing_stability_weights"], n, rng)
+        employment_status = sample_categorical(arch["employment_status_weights"], n, rng)
+        education_level = sample_categorical(arch["education_level_weights"], n, rng)
+        insurance_status = sample_categorical(arch["insurance_status_weights"], n, rng)
 
+        # 0 = no support network, 10 = very supported
+        social_support_score = np.clip(
+            rng.normal(loc=arch["social_support_mean"], scale=2.0, size=n), 0, 10
+        ).round().astype(int)
 
-def _draw_noise_categorical(n_archetypes: int, rng: np.random.Generator) -> dict:
-    result = {}
-    for feat in CATEGORICAL_COLUMNS:
-        a = rng.integers(0, n_archetypes)
-        probs = ARCHETYPE_CATEGORICAL_PARAMS[a][feat]
-        levels = list(probs.keys())
-        weights = list(probs.values())
-        result[feat] = rng.choice(levels, p=weights)
-    return result
+        # gamma distribution: right-skewed, most patients close, a few far out
+        distance_to_clinic_miles = np.clip(
+            rng.gamma(shape=2.0, scale=arch["distance_mean"] / 2.0, size=n), 1, 60
+        ).round(1)
 
+        respiratory_severity = sample_ordinal(arch["respiratory_severity_mean"], n, rng)
+        fatigue_level = sample_ordinal(arch["fatigue_level_mean"], n, rng)
+        joint_pain = sample_ordinal(arch["joint_pain_mean"], n, rng)
 
-# ---------------------------------------------------------------------------
-# Main generator
-# ---------------------------------------------------------------------------
+        fever_present = rng.random(n) < arch["fever_prob"]
 
-def generate_synthetic_data(
-    n_patients: int = 700,
-    n_archetypes: int = 4,
-    noise_fraction: float = 0.10,
-    random_seed: int = 42,
-) -> pd.DataFrame:
-    """
-    Generate a synthetic Valley Fever patient dataset with latent archetype
-    structure plus a fraction of unstructured "noise" patients.
+        # classic Valley Fever rash, uncommon but distinctive (see README)
+        erythema_nodosum = rng.random(n) < arch["erythema_prob"]
 
-    Parameters
-    ----------
-    n_patients : total number of synthetic patients to generate.
-    n_archetypes : number of latent archetypes to draw structured patients
-        from (must be <= the number of archetypes defined in
-        ARCHETYPE_NAMES / ARCHETYPE_SYMPTOM_PARAMS / ARCHETYPE_CATEGORICAL_PARAMS).
-    noise_fraction : fraction of patients (0-1) drawn with each feature
-        independently sampled from the overall population marginal, rather
-        than jointly from one archetype. See module docstring for rationale.
-    random_seed : seed for the random generator, for reproducibility.
+        # right-skewed again, most patients near the mean but with a long tail
+        symptom_duration_days = np.clip(
+            rng.gamma(shape=2.0, scale=arch["symptom_duration_mean"] / 2.0, size=n), 3, 120
+        ).round().astype(int)
 
-    Returns
-    -------
-    DataFrame with columns: patient_id, the 10 symptom severity columns,
-    the 6 SDOH/categorical columns, and `true_archetype` (ground truth for
-    validation only -- see module docstring; do not feed into clustering).
-    """
-    n_defined = len(ARCHETYPE_NAMES)
-    if not (1 <= n_archetypes <= n_defined):
-        raise ValueError(
-            f"n_archetypes must be between 1 and {n_defined} "
-            f"(the number of archetypes defined in this module), got {n_archetypes}."
+        # poisson fits "count of times misdiagnosed" well
+        prior_misdiagnosis_count = np.clip(
+            rng.poisson(lam=arch["prior_misdiagnosis_mean"], size=n), 0, 3
         )
-    if not (0.0 <= noise_fraction <= 1.0):
-        raise ValueError(f"noise_fraction must be in [0, 1], got {noise_fraction}.")
 
-    rng = np.random.default_rng(random_seed)
+        block = pd.DataFrame(
+            {
+                "respiratory_severity": respiratory_severity,
+                "fatigue_level": fatigue_level,
+                "fever_present": fever_present,
+                "joint_pain": joint_pain,
+                "erythema_nodosum": erythema_nodosum,
+                "symptom_duration_days": symptom_duration_days,
+                "prior_misdiagnosis_count": prior_misdiagnosis_count,
+                "housing_stability": housing_stability,
+                "employment_status": employment_status,
+                "education_level": education_level,
+                "social_support_score": social_support_score,
+                "insurance_status": insurance_status,
+                "distance_to_clinic_miles": distance_to_clinic_miles,
+                # answer key for validation later, not a clustering input
+                "ground_truth_archetype": arch["name"],
+            }
+        )
+        blocks.append(block)
 
-    n_noise = int(round(n_patients * noise_fraction))
-    n_structured = n_patients - n_noise
+    cohort = pd.concat(blocks, ignore_index=True)
 
-    # Balanced (as evenly as possible) assignment of structured patients
-    # across archetypes, so downstream value_counts / cluster-size sanity
-    # checks aren't confounded by an accidental class imbalance.
-    archetype_ids = list(range(n_archetypes))
-    base_count = n_structured // n_archetypes
-    remainder = n_structured % n_archetypes
-    structured_assignment = np.repeat(archetype_ids, base_count)
-    if remainder:
-        extra = rng.choice(archetype_ids, size=remainder, replace=False)
-        structured_assignment = np.concatenate([structured_assignment, extra])
-    rng.shuffle(structured_assignment)
+    # shuffle so archetype order doesn't leak through row order
+    cohort = cohort.sample(frac=1, random_state=42).reset_index(drop=True)
+    return cohort
 
-    rows = []
 
-    for archetype_idx in structured_assignment:
-        row = {}
-        row.update(_draw_numeric_from_archetype(archetype_idx, rng))
-        row.update(_draw_categorical_from_archetype(archetype_idx, rng))
-        row["true_archetype"] = ARCHETYPE_NAMES[archetype_idx]
-        rows.append(row)
+def generate_dataset(n=N):
+    """Glue everything together: archetype-based cohort plus patient IDs."""
+    cohort = generate_cohort()
+    assert len(cohort) == n, f"Archetype counts must sum to N={n}"
 
-    for _ in range(n_noise):
-        row = {}
-        row.update(_draw_noise_numeric(n_archetypes, rng))
-        row.update(_draw_noise_categorical(n_archetypes, rng))
-        row["true_archetype"] = NOISE_LABEL
-        rows.append(row)
+    patient_ids = [f"SYN-{i:04d}" for i in range(1, n + 1)]
+    combined = pd.concat([pd.DataFrame({"patient_id": patient_ids}), cohort], axis=1)
 
-    df = pd.DataFrame(rows)
-
-    # Shuffle so structured/noise patients aren't in contiguous blocks, then
-    # assign patient IDs after shuffling so ID order carries no information.
-    df = df.sample(frac=1.0, random_state=random_seed).reset_index(drop=True)
-    df.insert(0, "patient_id", [f"P{i:04d}" for i in range(1, len(df) + 1)])
-
-    # Keep column order stable and readable: id, symptoms, SDOH, ground truth.
-    df = df[["patient_id"] + SYMPTOM_COLUMNS + CATEGORICAL_COLUMNS + ["true_archetype"]]
-
-    return df
+    return combined
 
 
 if __name__ == "__main__":
-    OUTPUT_PATH = "synthetic_patients.csv"
+    df = generate_dataset(N)
 
-    data = generate_synthetic_data(
-        n_patients=700,
-        n_archetypes=4,
-        noise_fraction=0.10,
-        random_seed=42,
-    )
+    out_path = "synthetic_patients.csv"
+    df.to_csv(out_path, index=False)
 
-    data.to_csv(OUTPUT_PATH, index=False)
+    print(f"Generated {len(df)} synthetic patients -> {out_path}\n")
 
-    print(f"Saved {len(data)} synthetic patients to {OUTPUT_PATH}\n")
+    print("Archetype balance (ground truth, not a clustering input):")
+    print(df["ground_truth_archetype"].value_counts())
 
-    print("Patient counts by true_archetype (ground truth, for validation only):")
-    print(data["true_archetype"].value_counts())
+    print("\nPreview (first 5 rows):")
+    print(df.head(5))
 
-    print("\nSummary statistics for numeric symptom severity columns:")
-    print(data[SYMPTOM_COLUMNS].describe())
+    print("\nNumeric column summary (mean / std):")
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    print(df[numeric_cols].agg(["mean", "std"]).T)
